@@ -137,6 +137,27 @@ FEATURE_GATE = "IgnoreFieldDrift"
 # Generous window for the new pod to roll out and take over reconciliation.
 ROLLOUT_WAIT_SECONDS = 120
 
+# How long to wait for a resource to reach ACK.ResourceSynced=True (120s).
+SYNC_WAIT_PERIODS = 12
+SYNC_PERIOD_LENGTH = 10
+
+# An inert annotation patched onto the CR purely to trigger a reconcile. An
+# out-of-band AWS change produces no watch event, and this controller's resync
+# period is the runtime default of 10 hours -- config/controller/deployment.yaml
+# (what the e2e job deploys via kustomize) passes no --reconcile-*-resync-seconds
+# override and Listener's RequeueOnSuccessSeconds() is 0, so getResyncPeriod
+# falls through to defaultResyncPeriod. Without an explicit nudge the controller
+# would not look at the resource again for the rest of the run, and any
+# assertion about what it did with the drift would be vacuous.
+#
+# Touching an annotation is enough because the runtime adds
+# AnnotationChangedPredicate to the event filter whenever the IgnoreFieldDrift
+# gate is on (runtime reconciler.go, SetupWithManager); the default filter is
+# GenerationChangedPredicate alone, which an annotation edit would not satisfy.
+# This keeps the probe off the spec, so the only delta the reconcile sees is the
+# external drift itself.
+RECONCILE_PROBE_ANNOTATION = "e2e.test.ack.aws.dev/reconcile-probe"
+
 # The declared (spec) weights and the externally-shifted weights. The two must
 # differ so a revert would be observable.
 DECLARED_WEIGHT_1 = 90
@@ -322,6 +343,16 @@ def two_target_groups(elbv2_client):
     for ref in refs:
         cr = k8s.wait_resource_consumed_by_controller(ref)
         assert cr is not None
+        # wait_resource_consumed_by_controller returns as soon as the resource
+        # has any .status at all, which is the first status write and predates
+        # the ARN landing. The listener below resolves these target groups by
+        # reference, so wait until each is actually reconciled rather than
+        # merely observed -- otherwise the listener's own reference resolution
+        # is still pending when its fixture reads status.
+        assert k8s.wait_on_condition(
+            ref, "ACK.ResourceSynced", "True",
+            wait_periods=SYNC_WAIT_PERIODS, period_length=SYNC_PERIOD_LENGTH,
+        ), f"target group {ref.name} never reached ACK.ResourceSynced=True"
 
     yield names
 
@@ -379,6 +410,17 @@ def ignore_field_drift_listener(request, elbv2_client, simple_load_balancer, two
     assert cr is not None
     assert k8s.get_resource_exists(ref)
 
+    # Same trap as in two_target_groups, and worse here: the test reads the ARN
+    # out of the CR this fixture yields, so a snapshot taken at the first status
+    # write (before status.ackResourceMetadata exists) gives it a KeyError it
+    # cannot recover from. Wait for a real reconcile, then re-read.
+    assert k8s.wait_on_condition(
+        ref, "ACK.ResourceSynced", "True",
+        wait_periods=SYNC_WAIT_PERIODS, period_length=SYNC_PERIOD_LENGTH,
+    ), f"listener {resource_name} never reached ACK.ResourceSynced=True"
+    cr = k8s.get_resource(ref)
+    assert cr["status"]["ackResourceMetadata"]["arn"]
+
     yield (ref, cr)
 
     try:
@@ -415,6 +457,13 @@ class TestListenerIgnoreFieldDrift:
         ), f"unexpected baseline weights: {baseline}"
         condition.assert_synced(ref)
 
+        # Capture the synced timestamp before touching anything. ACK rewrites
+        # ACK.ResourceSynced.lastTransitionTime on every reconcile, so this is
+        # what lets the assertions below distinguish "the controller reconciled
+        # and left the drift alone" from "the controller never looked".
+        synced_before = condition.get_synced_last_transition_time(ref)
+        assert synced_before is not None
+
         # Snapshot the live forward action, then flip the weights out-of-band
         # (the blue/green deploy tool shifting traffic).
         forward = next(
@@ -437,40 +486,77 @@ class TestListenerIgnoreFieldDrift:
         )
         time.sleep(MODIFY_WAIT_AFTER_SECONDS)
 
-        # The externally-shifted weights must survive: the controller does not
-        # reconcile drift on spec.defaultActions, so it does not call
-        # ModifyListener to revert them.
-        after = _weights_by_tg_arn(validator.get_listener(listener_arn))
-        assert after == {
+        expected_external = {
             tgs[0]["TargetGroupArn"]: EXTERNAL_WEIGHT_1,
             tgs[1]["TargetGroupArn"]: EXTERNAL_WEIGHT_2,
-        }, (
-            "controller reverted externally-shifted listener weights despite "
-            f"ignore-field-drift on spec.defaultActions: {after}"
+        }
+
+        # Precondition: AWS really reports the shifted distribution before the
+        # controller is asked to look at it. If the reconcile forced below raced
+        # ahead of ModifyListener taking effect, sdkFind would read the original
+        # 90/10, find no drift, and the survival assertion would pass for a
+        # reason that has nothing to do with the feature.
+        shifted = _weights_by_tg_arn(validator.get_listener(listener_arn))
+        assert shifted == expected_external, (
+            f"out-of-band ModifyListener did not take effect: {shifted}"
         )
 
-        # The resource stays Synced even though the live weights (50/50) differ
-        # from the declared spec (90/10).
-        assert k8s.wait_on_condition(
+        # Force a reconcile. Nothing else will: the AWS-side change produced no
+        # watch event and the next resync is 10 hours out (see
+        # RECONCILE_PROBE_ANNOTATION). Then require that a reconcile which
+        # started AFTER the drift completed with ACK.ResourceSynced=True. This
+        # single assertion carries both claims -- that the controller looked, and
+        # that it still considers the resource in sync despite the live weights
+        # (50/50) differing from the declared spec (90/10). A plain
+        # wait_on_condition here would return on its first poll off the condition
+        # written back at create time and prove neither.
+        k8s.patch_custom_resource(
+            ref, {"metadata": {"annotations": {RECONCILE_PROBE_ANNOTATION: "1"}}},
+        )
+        assert k8s.wait_on_condition_after(
             ref, "ACK.ResourceSynced", "True",
-            wait_periods=6, period_length=10,
+            last_transition_after=synced_before,
+            wait_periods=SYNC_WAIT_PERIODS, period_length=SYNC_PERIOD_LENGTH,
+        ), (
+            "no reconcile completed with ACK.ResourceSynced=True after the "
+            "out-of-band weight shift"
+        )
+
+        # Now that a fresh reconcile is known to have run, this is meaningful:
+        # the controller examined the resource and declined to call
+        # ModifyListener to revert the ignored spec.defaultActions path.
+        after = _weights_by_tg_arn(validator.get_listener(listener_arn))
+        assert after == expected_external, (
+            "controller reverted externally-shifted listener weights despite "
+            f"ignore-field-drift on spec.defaultActions: {after}"
         )
 
         # Editing the ignored field in the spec is retained but NOT pushed to
         # AWS: patch the declared weights to a third value and confirm the live
         # weights are unchanged (still the external 50/50).
+        synced_before_edit = condition.get_synced_last_transition_time(ref)
+        assert synced_before_edit is not None
+
         latest = k8s.get_resource(ref)
         new_actions = latest["spec"]["defaultActions"]
         new_actions[0]["forwardConfig"]["targetGroups"][0]["weight"] = 70
         new_actions[0]["forwardConfig"]["targetGroups"][1]["weight"] = 30
         k8s.patch_custom_resource(ref, {"spec": {"defaultActions": new_actions}})
-        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+
+        # This patch bumps metadata.generation, so a reconcile is guaranteed to
+        # be queued -- but not that it has finished. Wait for one that started
+        # after the edit rather than assuming a fixed sleep covers it.
+        assert k8s.wait_on_condition_after(
+            ref, "ACK.ResourceSynced", "True",
+            last_transition_after=synced_before_edit,
+            wait_periods=SYNC_WAIT_PERIODS, period_length=SYNC_PERIOD_LENGTH,
+        ), (
+            "no reconcile completed with ACK.ResourceSynced=True after the "
+            "spec edit to the ignored field"
+        )
 
         after_edit = _weights_by_tg_arn(validator.get_listener(listener_arn))
-        assert after_edit == {
-            tgs[0]["TargetGroupArn"]: EXTERNAL_WEIGHT_1,
-            tgs[1]["TargetGroupArn"]: EXTERNAL_WEIGHT_2,
-        }, (
+        assert after_edit == expected_external, (
             "controller pushed a spec edit on an ignored field to AWS: "
             f"{after_edit}"
         )
